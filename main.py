@@ -1,61 +1,104 @@
 from stock_info import get_stock_info
-from embeddings import cosine_similarity_between_sentences
 from company_tickers import get_company_tickers
-import json
+from langchain.schema import Document
+from langchain_pinecone import PineconeVectorStore
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from pinecone import Pinecone, ServerlessSpec
+from dotenv import load_dotenv
 import os
+import json
 
-def load_company_tickers_from_file(file_path="company_tickers.json"):
-    """
-    Loads company tickers from a local JSON file.
+# Load environment variables
+load_dotenv()
 
-    Args:
-        file_path (str): Path to the company tickers JSON file.
+# Constants
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")  # Replace with your API key or use a .env file
+PINECONE_ENV = os.getenv("PINECONE_ENV")  # Replace with your Pinecone environment
+INDEX_NAME = os.getenv("PINECONE_INDEX")
+NAMESPACE = "stock-descriptions"
+SUCCESSFUL_TICKERS_FILE = "successful_tickers.txt"
+UNSUCCESSFUL_TICKERS_FILE = "unsuccessful_tickers.txt"
 
-    Returns:
-        list: A list of tickers extracted from the JSON file.
-    """
-    if not os.path.exists(file_path):
-        print(f"File '{file_path}' does not exist. Fetching data from the server...")
-        get_company_tickers()  # Download the file if it doesn't exist
-    
-    with open(file_path, "r", encoding="utf-8") as file:
-        data = json.load(file)
-    
-    # Extract tickers from the JSON structure
-    tickers = [data[key]["ticker"] for key in data]
-    return tickers
+# Initialize Pinecone instance
+pinecone = Pinecone(api_key=PINECONE_API_KEY)
+if INDEX_NAME not in [index.name for index in pinecone.list_indexes().indexes]:
+    pinecone.create_index(
+        name=INDEX_NAME,
+        dimension=768,  # Ensure this matches your embedding dimension
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region=PINECONE_ENV)
+    )
+index = pinecone.Index(INDEX_NAME)
 
+# Initialize embeddings
+hf_embeddings = HuggingFaceEmbeddings()
 
-def fetch_data_for_tickers(tickers, max_companies=5):
-    """
-    Fetches and prints stock information for a list of tickers.
+# Load company tickers
+company_tickers = get_company_tickers()
 
-    Args:
-        tickers (list): List of stock tickers to fetch information for.
-        max_companies (int): Maximum number of companies to fetch data for.
-                             Default is 5 for demonstration purposes.
-    """
-    for i, ticker in enumerate(tickers[:max_companies], start=1):
-        print(f"\nFetching data for company {i}/{max_companies}: {ticker}")
-        try:
-            company_info = get_stock_info(ticker)
-            print(json.dumps(company_info, indent=4))
-        except Exception as e:
-            print(f"Failed to fetch data for {ticker}: {e}")
+# Tracking lists for tickers
+successful_tickers = []
+unsuccessful_tickers = []
 
+# Load existing progress
+if os.path.exists(SUCCESSFUL_TICKERS_FILE):
+    with open(SUCCESSFUL_TICKERS_FILE, "r") as f:
+        successful_tickers = [line.strip() for line in f if line.strip()]
 
-# Main execution
-if __name__ == "__main__":
-    # Load tickers from the JSON file
-    tickers = load_company_tickers_from_file()
+if os.path.exists(UNSUCCESSFUL_TICKERS_FILE):
+    with open(UNSUCCESSFUL_TICKERS_FILE, "r") as f:
+        unsuccessful_tickers = [line.strip() for line in f if line.strip()]
 
-    # Fetch and print stock data for the first 5 companies
-    fetch_data_for_tickers(tickers)
+# Initialize Pinecone vector store
+vectorstore = PineconeVectorStore(
+    index_name=INDEX_NAME,
+    embedding=hf_embeddings,
+    index=index
+)
 
-    # Example: Compare business description to a custom query
-    company_description = "I want to find companies that make food and are headquartered in California"
-    if tickers:
-        aapl_info = get_stock_info(tickers[1])  # Use the second company (AAPL in the example JSON)
-        aapl_description = aapl_info.get('Business Summary', "")
-        similarity = cosine_similarity_between_sentences(aapl_description, company_description)
-        print(f"\nSimilarity between descriptions: {similarity:.4f}")
+# Process each ticker
+for idx, stock in company_tickers.items():
+    ticker = stock["ticker"]
+
+    # Skip already processed tickers
+    if ticker in successful_tickers or ticker in unsuccessful_tickers:
+        print(f"Skipping already processed ticker: {ticker}")
+        continue
+
+    try:
+        # Fetch stock data
+        stock_data = get_stock_info(ticker)
+        stock_description = stock_data.get("Business Summary", "")
+
+        # Skip if no business description
+        if not stock_description:
+            print(f"No description available for ticker: {ticker}")
+            unsuccessful_tickers.append(ticker)
+            continue
+
+        # Save embeddings to Pinecone
+        document = Document(page_content=stock_description, metadata=stock_data)
+        vectorstore_from_documents = PineconeVectorStore.from_documents(
+            documents=[document],
+            embedding=hf_embeddings,
+            index_name=INDEX_NAME,
+            namespace=NAMESPACE
+        )
+
+        print(f"Successfully processed and saved embeddings for ticker: {ticker}")
+        successful_tickers.append(ticker)
+
+    except Exception as e:
+        print(f"Error processing ticker {ticker}: {e}")
+        unsuccessful_tickers.append(ticker)
+
+    # Save progress to files
+    with open(SUCCESSFUL_TICKERS_FILE, "w") as f:
+        f.write("\n".join(successful_tickers))
+
+    with open(UNSUCCESSFUL_TICKERS_FILE, "w") as f:
+        f.write("\n".join(unsuccessful_tickers))
+
+print("\nProcessing complete.")
+print(f"Successfully processed tickers: {len(successful_tickers)}")
+print(f"Failed tickers: {len(unsuccessful_tickers)}")
