@@ -5,6 +5,7 @@ from langchain_pinecone import PineconeVectorStore
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from pinecone import Pinecone, ServerlessSpec
 from dotenv import load_dotenv
+import concurrent.futures
 import os
 import json
 
@@ -12,8 +13,8 @@ import json
 load_dotenv()
 
 # Constants
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")  # Replace with your API key or use a .env file
-PINECONE_ENV = os.getenv("PINECONE_ENV")  # Replace with your Pinecone environment
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_ENV = os.getenv("PINECONE_ENV")
 INDEX_NAME = os.getenv("PINECONE_INDEX")
 NAMESPACE = "stock-descriptions"
 SUCCESSFUL_TICKERS_FILE = "successful_tickers.txt"
@@ -56,49 +57,66 @@ vectorstore = PineconeVectorStore(
     index=index
 )
 
-# Process each ticker
-for idx, stock in company_tickers.items():
-    ticker = stock["ticker"]
-
-    # Skip already processed tickers
-    if ticker in successful_tickers or ticker in unsuccessful_tickers:
-        print(f"Skipping already processed ticker: {ticker}")
-        continue
+def process_stock(stock_ticker: str) -> str:
+    # Skip if already processed
+    if stock_ticker in successful_tickers:
+        return f"Already processed {stock_ticker}"
 
     try:
-        # Fetch stock data
-        stock_data = get_stock_info(ticker)
-        stock_description = stock_data.get("Business Summary", "")
+        # Get and store stock data
+        stock_data = get_stock_info(stock_ticker)
+        stock_description = stock_data['Business Summary']
 
-        # Skip if no business description
-        if not stock_description:
-            print(f"No description available for ticker: {ticker}")
-            unsuccessful_tickers.append(ticker)
-            continue
-
-        # Save embeddings to Pinecone
-        document = Document(page_content=stock_description, metadata=stock_data)
-        vectorstore_from_documents = PineconeVectorStore.from_documents(
-            documents=[document],
+        # Store stock description in Pinecone
+        vectorstore_from_texts = PineconeVectorStore.from_documents(
+            documents=[Document(page_content=stock_description, metadata=stock_data)],
             embedding=hf_embeddings,
             index_name=INDEX_NAME,
             namespace=NAMESPACE
         )
 
-        print(f"Successfully processed and saved embeddings for ticker: {ticker}")
-        successful_tickers.append(ticker)
+        # Track success
+        with open(SUCCESSFUL_TICKERS_FILE, 'a') as f:
+            f.write(f"{stock_ticker}\n")
+        successful_tickers.append(stock_ticker)
+
+        return f"Processed {stock_ticker} successfully"
 
     except Exception as e:
-        print(f"Error processing ticker {ticker}: {e}")
-        unsuccessful_tickers.append(ticker)
+        # Track failure
+        with open(UNSUCCESSFUL_TICKERS_FILE, 'a') as f:
+            f.write(f"{stock_ticker}\n")
+        unsuccessful_tickers.append(stock_ticker)
 
-    # Save progress to files
-    with open(SUCCESSFUL_TICKERS_FILE, "w") as f:
-        f.write("\n".join(successful_tickers))
+        return f"ERROR processing {stock_ticker}: {e}"
 
-    with open(UNSUCCESSFUL_TICKERS_FILE, "w") as f:
-        f.write("\n".join(unsuccessful_tickers))
+def parallel_process_stocks(tickers: list, max_workers: int = 10) -> None:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_ticker = {
+            executor.submit(process_stock, ticker): ticker
+            for ticker in tickers
+        }
 
-print("\nProcessing complete.")
-print(f"Successfully processed tickers: {len(successful_tickers)}")
-print(f"Failed tickers: {len(unsuccessful_tickers)}")
+        for future in concurrent.futures.as_completed(future_to_ticker):
+            ticker = future_to_ticker[future]
+            try:
+                result = future.result()
+                print(result)
+
+                # Stop on error
+                if result.startswith("ERROR"):
+                    print(f"Stopping program due to error in {ticker}")
+                    executor.shutdown(wait=False)
+                    raise SystemExit(1)
+
+            except Exception as exc:
+                print(f'{ticker} generated an exception: {exc}')
+                print("Stopping program due to exception")
+                executor.shutdown(wait=False)
+                raise SystemExit(1)
+
+# Prepare your tickers
+tickers_to_process = [company_tickers[num]['ticker'] for num in company_tickers.keys()]
+
+# Process them
+parallel_process_stocks(tickers_to_process, max_workers=10)
